@@ -21,23 +21,21 @@ DNSServer dnsServer;
 String myHostName = "My-ESP8266";
 String myESP8266page = "<a href='/update'>Update Firmware</span></a>";
 String myNotFoundPage = "<h2>Error, page not found! <a href='/'>Go back to main page!</a></h2>";
-static int PINOLED = 16;
+//static int PINOLED = 16;
 
 //Definicoes do Sensor max6675
 float temp_c;
-int thermoDO = 12; //D5 -> SCK
-int thermoCS = 13;  //D6 -> SO
-int thermoCLK = 14;  //D7 -> CS
-MAX6675 thermocouple(thermoCLK, thermoCS, thermoDO);
+int thermoSO = 23;
+int thermoCS = 5;
+int thermoSCK = 18;
+MAX6675 thermocouple(thermoSCK, thermoCS, thermoSO);
 
-//definicao rele ventilacao
-const int fanPin = 4;
-
-//definicao do aquecedor (SSR VCC)
-const int pwmPin = 5;  
+const int fanPin = 22; //definicao rele ventilacao
+const int pwmPin = 21;  //definicao do aquecedor (SSR VCC)
 
 //definicao dados da torra
 String dados_torra = "";
+double *tempo, *temperatura;
 boolean mostra_temp_app = false;
 boolean iniciaDesligVent = false;
 
@@ -58,19 +56,24 @@ volatile bool dataChanged = false;
 
 unsigned long startedAtTemp = millis();
 unsigned long startedAtTempVent = millis();
+unsigned long startedAtTempAquec = millis();
+boolean calculo_vetor_PID = true;
 
 //Definicao variaveis PID
 double Setpoint, Input, Output;
-double Kp = 6, Ki = 3, Kd = 2; //default
+double Kp = 50, Ki = 1, Kd = 70; //default
 unsigned long windowStartTime;
 #define PWM_PERIOD 5000
 #define FREQ_PID 250            // Run PID every 250 ms
 unsigned long lastRun;
 PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
 
+//variaveis de controle
+volatile bool aquecendo = false;
+volatile bool torrando = false;
 
 //funçao que transforma o que e recebido pela serial em uma string
-String lerserial() { 
+String lerserial() {
   String conteudo = ""; // armazena o frase inteira
   char carac; //armazena cada caracter
   while (Serial.available() > 0) { // enquando receber caracteres
@@ -80,16 +83,93 @@ String lerserial() {
     }
     delay(10); //delay para nova leitura
   }
-  Serial.print("Recebi: ");
-  Serial.println("\n\n\n\n\n\n\n\n\n\n\n\n");
-  Serial.println(conteudo);
-  Serial.println("\n\n\n\n\n\n\n\n\n\n\n\n");
   return conteudo; //retorna o valor da string conteudo
 }
+
+void separaTemperaturaETempo(double *v, int cont) {
+  double *temper;
+  temper = (double*) malloc(sizeof(double) * (cont / 2));
+  double *temp;
+  temp = (double*) malloc(sizeof(double) * (cont / 2));
+
+  int j = 0, k = 0;
+  for (int i = 0; i < (cont); i++) {
+    if (i % 2 == 0) {
+      temper[j] = v[i];
+      j++;
+    } else {
+      temp[k] = v[i];
+      k++;
+    }
+    temperatura = temper;
+    tempo = temp;
+  }
+}
+
+
+int conta_segundos = 0;
+int posicao_segundos = 0;
+double acumulado_segundos = 0.0;
+
+void defineSetPoint() {
+
+  int valor = digitalRead(fanPin);
+  if (valor == HIGH) { //ventilaçao desligada
+    Setpoint = 0.0;
+    //reseta as variaveis de controle
+    conta_segundos = 0;
+    posicao_segundos = 0;
+    acumulado_segundos = 0.0;
+    calculo_vetor_PID = true;
+  }
+  if (valor == LOW && iniciaDesligVent) { //ventilação ligada porem resfriando
+    Setpoint = 0.0;
+    //reseta as variaveis de controle
+    conta_segundos = 0;
+    posicao_segundos = 0;
+    acumulado_segundos = 0.0;
+    torrando = false;
+    aquecendo = false;
+    calculo_vetor_PID = true;
+  }
+
+  if (valor == LOW && !iniciaDesligVent) { //aquecimento + ventilacao
+
+    if (aquecendo) {
+      if (temperatura[0] > 200) {
+        Setpoint = 200;
+      } else {
+        Setpoint = temperatura[0];
+      }
+    }
+
+    if (torrando) {
+      double incremento = 0.0;
+
+      if (conta_segundos == tempo[posicao_segundos]) {
+        posicao_segundos++;
+      }
+      if (conta_segundos >= tempo[posicao_segundos - 1] && conta_segundos < tempo[posicao_segundos]) {
+        incremento = (temperatura[posicao_segundos - 1] - temperatura[posicao_segundos]) / (tempo[posicao_segundos - 1] - tempo[posicao_segundos]);
+      }
+      conta_segundos++;
+      acumulado_segundos = acumulado_segundos + incremento;
+
+      if (temperatura[0] + acumulado_segundos > 200) {
+        Setpoint = 200;
+      } else {
+        Setpoint = temperatura[0] + acumulado_segundos;
+      }
+    }
+  }
+}
+
 
 //Funcao de callback do Firebase
 void streamCallback(FirebaseStream data)
 {
+
+  yield();
   Serial.printf("sream path, %s\nevent path, %s\ndata type, %s\nevent type, %s\n\n",
                 data.streamPath().c_str(),
                 data.dataPath().c_str(),
@@ -105,76 +185,79 @@ void streamCallback(FirebaseStream data)
   // BearSSL reserved Rx buffer size is less than the actual stream payload.
   Serial.printf("Received stream payload size: %d (Max. %d)\n\n", data.payloadLength(), data.maxPayloadLength());
 
-  String aux = "/dispositivos/";
-  String mac = String(WiFi.macAddress());
+  String mac = "/" + String(WiFi.macAddress());
   mac.toUpperCase();
-  String aux2 = "/status";
-  String aux3 = aux + mac + aux2;
+  String aux2 = F("/aquecendo");
+  String aux3 = mac + aux2; //dispositivos/MAC/aquecendo
   String aux4 = data.dataPath().c_str();
-  String aux5 = "/torrando";
-  String aux6 = aux + mac + aux5;
-  String aux7 = "/dados";
-  String aux8 = aux + mac + aux7;
-  Serial.println(aux3);
-  Serial.println(aux4);
-  Serial.println(aux6);
+  String aux5 = F("/torrando");
+  String aux6 = mac + aux5; //dispositivos/MAC/torrando
+  String aux7 = F("/resfriando");
+  String aux8 = mac + aux7;
 
   if ( aux4 == aux3 ) {
-    
-    Serial.println("entrei Ventilar!!");
     yield();
     bool bVal;
-    //dispositivos/MAC/status
-    Serial.printf("Get bool ref... %s\n", Firebase.RTDB.getBool(&fbdo, aux4, &bVal) ? bVal ? "true" : "false" : fbdo.errorReason().c_str());
-    
-    if (bVal) { //status = true 
-      Serial.printf("Get string... %s\n", Firebase.RTDB.getString(&fbdo, aux8) ? fbdo.to<const char *>() : fbdo.errorReason().c_str());
-      dados_torra = Firebase.RTDB.getString(&fbdo, aux8);
-      mostra_temp_app = true;
-      Serial.println(dados_torra);
-      digitalWrite(fanPin, LOW);       // -> Liga motor DC
-      Serial.println("ventilando!");
+    //dispositivos/MAC/aquecendo
+    Serial.printf("Get bool ref... %s\n", Firebase.RTDB.getBool(&fbdo, data.streamPath().c_str() + aux4, &bVal) ? bVal ? "true" : "false" : fbdo.errorReason().c_str());
+    yield();
 
-    } else {  //status = false
+    if (bVal) { //aquecendo = true
+      aquecendo = true;
+      mostra_temp_app = true;
+      digitalWrite(fanPin, LOW);       // -> Liga motor DC
+    } else { //aquecendo = false
+      aquecendo = false;
+
       bool bVal2;
       //dispositivos/MAC/torrando
-      Serial.printf("Get bool ref... %s\n", Firebase.RTDB.getBool(&fbdo, aux6, &bVal2) ? bVal2 ? "true" : "false" : fbdo.errorReason().c_str());
+      yield();
+      Serial.printf("Get bool ref... %s\n", Firebase.RTDB.getBool(&fbdo, data.streamPath().c_str() + aux6, &bVal2) ? bVal2 ? "true" : "false" : fbdo.errorReason().c_str());
+      yield();
       if (bVal2) { //torrando = true
+        torrando = true;
         digitalWrite(fanPin, LOW);
-        Serial.println("ventilando + torrando!");
       } else {  //torrando = false
+        torrando = false;
         iniciaDesligVent = true;
-        mostra_temp_app = false;
         startedAtTempVent = millis();
-        Serial.println("nao ventilando!");
+        mostra_temp_app = false;
+        yield();
+        Serial.printf("Set bool RESFRIANDO... %s\n", Firebase.RTDB.setBool(&fbdo,  data.streamPath().c_str() + aux8, true) ? "ok" : fbdo.errorReason().c_str());
+        yield();
       }
     }
   }
 
   if ( aux4 == aux6 ) {
     yield();
-    Serial.println("entrei Torrar!!");
     bool bVal2;
     //dispositivos/MAC/torrando
-    Serial.printf("Get bool ref... %s\n", Firebase.RTDB.getBool(&fbdo, aux6, &bVal2) ? bVal2 ? "true" : "false" : fbdo.errorReason().c_str());
+    Serial.printf("Get bool ref... %s\n", Firebase.RTDB.getBool(&fbdo, data.streamPath().c_str() + aux6, &bVal2) ? bVal2 ? "true" : "false" : fbdo.errorReason().c_str());
+    yield();
     if (bVal2) { //torrando = true
+      torrando = true;
       digitalWrite(fanPin, LOW);
-      Serial.println("torrando!");
     } else {   //torrando = false
+      torrando = false;
       startedAtTempVent = millis();
       iniciaDesligVent = true;
       mostra_temp_app = false;
-      Serial.println("nao torrando!");
+      yield();
+      Serial.printf("Set bool RESFRIANDO... %s\n", Firebase.RTDB.setBool(&fbdo, data.streamPath().c_str() + aux8, true) ? "ok" : fbdo.errorReason().c_str());
+      yield();
     }
   }
 
   // Due to limited of stack memory, do not perform any task that used large memory here especially starting connect to server.
   // Just set this flag and check it status later.
   dataChanged = true;
+  yield();
 }
 
 void streamTimeoutCallback(bool timeout)
 {
+  yield();
   if (timeout)
     Serial.println("stream timed out, resuming...\n");
 
@@ -188,6 +271,22 @@ void setup()
   // put your setup code here, to run once:
   // initialize the LED digital pin as an output.
   pinMode(PIN_LED, OUTPUT);
+
+  //RELÉ VENTILACAO
+  pinMode(fanPin, OUTPUT);
+  digitalWrite(fanPin, HIGH);
+
+  //AQUECEDOR
+  windowStartTime = millis();
+  pinMode(pwmPin, OUTPUT);
+  digitalWrite(pwmPin, LOW);
+
+  // Init PID driver
+  myPID.SetOutputLimits(0, 100);  // Give output as power percentage
+  myPID.SetMode(AUTOMATIC);
+  myPID.SetSampleTime(FREQ_PID);
+  myPID.SetTunings(Kp, Ki, Kd);
+
 
   Serial.begin(115200);
   while (!Serial);
@@ -510,13 +609,14 @@ void setup()
   //AsyncElegantOTA.begin(&webServer); // Start ElegantOTA
   webServer.begin();
   Serial.println("FOTA server ready!");
-  pinMode(PINOLED, OUTPUT);
+  //pinMode(PINOLED, OUTPUT);
 
   //Confirmacao ESP-APP
   webServer.on("/confirm.html", HTTP_GET, [](AsyncWebServerRequest * request)
   {
     request->send(200, "text/html", "<title>torradeira</title>");
   });
+
 
 
   //FIREBASE
@@ -545,31 +645,24 @@ void setup()
   stream.setBSSLBufferSize(2048 /* Rx in bytes, 512 - 16384 */, 512 /* Tx in bytes, 512 - 16384 */);
 #endif
 
-  if (!Firebase.RTDB.beginStream(&stream, "/"))
+  delay(10);
+  if (!Firebase.RTDB.beginStream(&stream, "/dispositivos"))
     Serial.printf("sream begin error, %s\n\n", stream.errorReason().c_str());
 
   Firebase.RTDB.setStreamCallback(&stream, streamCallback, streamTimeoutCallback);
 
-  //RELÉ VENTILACAO
-  pinMode(fanPin, OUTPUT);
-  digitalWrite(fanPin, HIGH);
-
-  //AQUECEDOR
-  windowStartTime = millis();
-  pinMode(pwmPin, OUTPUT);
-  digitalWrite(pwmPin, LOW);
-  // Init PID driver
-  myPID.SetOutputLimits(0, 100);  // Give output as power percentage
-  myPID.SetMode(AUTOMATIC);
-  myPID.SetSampleTime(FREQ_PID);
-  myPID.SetTunings(Kp, Ki, Kd);
+  //ESP.wdtDisable();
 
 }
 
 void runPID() {
   unsigned long now = millis();
+
   Input = thermocouple.readCelsius();
-  myPID.Compute();
+
+  if (!isnan(Input)) { //not NaN
+    myPID.Compute();
+  }
 
   if (now - windowStartTime > PWM_PERIOD)
   {
@@ -596,33 +689,96 @@ void runPID() {
   }
 }
 
+
 void loop()
 {
   // Call the double reset detector loop method every so often,
   // so that it can recognise when the timeout expires.
   // You can also call drd.stop() when you wish to no longer
   // consider the next reset as a double reset.
+  yield();
   drd->loop();
 
-  if (millis() - startedAtTemp > 2000 || startedAtTemp == 0)
+  if (millis() - startedAtTemp > 3000 || startedAtTemp == 0)
   {
     startedAtTemp = millis();
     temp_c = thermocouple.readCelsius();
     Serial.print("t1=");
     Serial.println(temp_c);
-    
+
     if (mostra_temp_app) {
       String aux = "/dispositivos/";
       String mac = String(WiFi.macAddress());
       mac.toUpperCase();
       String aux2 = "/temperatura";
       String aux3 = aux + mac + aux2;
-      Serial.printf("Set float... %s\n", Firebase.RTDB.setFloat(&fbdo, aux3 , temp_c) ? "ok" : fbdo.errorReason().c_str());
+      yield();
+      if (!isnan(Input)) {
+        Serial.printf("Set float... %s\n", Firebase.RTDB.setFloat(&fbdo, aux3 , temp_c) ? "ok" : fbdo.errorReason().c_str());
+      }
+      yield();
     }
   }
 
-  if (millis() - startedAtTempVent > 100000 && iniciaDesligVent) { // 100 segundos de ventilação ligada após termino da torra
-    //startedAtTempVent = millis();
+  if (millis() - startedAtTempAquec > 1000 || startedAtTempAquec == 0) {
+    startedAtTempAquec = millis();
+
+    if (mostra_temp_app && calculo_vetor_PID) {
+      String aux = "/dispositivos/";
+      String mac = String(WiFi.macAddress());
+      mac.toUpperCase();
+      String aux2 = "/dados";
+      String aux3 = aux + mac + aux2;
+      yield();
+      Serial.printf("Get string... %s\n", Firebase.RTDB.getString(&fbdo, aux3) ? fbdo.to<const char *>() : fbdo.errorReason().c_str());
+      yield();
+      String aux4 = "A,";
+      String aux5 = (fbdo.to<const char *>());
+      dados_torra = aux4 + aux5;
+      yield();
+
+      char c[1000];
+      dados_torra.toCharArray(c, 1000);
+
+      int tamanho = dados_torra.length();
+      int quantidade = 0;
+
+      for (int i = 0; i < tamanho; i++) {
+        if (c[i] == ',') {
+          Serial.println(c[i]);
+          quantidade++;
+        }
+      }
+      
+      char* token = strtok(c, ",");
+      double v[(quantidade * 2) - 1];
+      for (int i = 0; i < quantidade; i++) {
+        token = strtok(NULL, ",");
+        v[i] = strtod(token, NULL);
+        //Serial.println(v[i]);
+      }
+
+      separaTemperaturaETempo(v, quantidade);
+      v[(quantidade * 2) - 1] = NULL;
+
+      calculo_vetor_PID = false;
+    }
+    
+    defineSetPoint();
+  }
+
+
+  if (millis() - startedAtTempVent > 10000 && iniciaDesligVent) { // 100 segundos de ventilação ligada após termino da torra
+
+    String aux = "/dispositivos/";
+    String mac = String(WiFi.macAddress());
+    mac.toUpperCase();
+    String aux2 = "/resfriando";
+    String aux3 = aux + mac + aux2;
+    yield();
+    Serial.printf("Set bool... %s\n", Firebase.RTDB.setBool(&fbdo, aux3, false) ? "ok" : fbdo.errorReason().c_str());
+    yield();
+
     digitalWrite(fanPin, HIGH);
     iniciaDesligVent = false;
   }
@@ -637,14 +793,20 @@ void loop()
     FirebaseJson json2;
     json2.add(mac);
 
+    yield();
     Serial.printf("Set string... %s\n", Firebase.RTDB.updateNodeAsync(&fbdo, path_aux, &json2) ? "ok" : fbdo.errorReason().c_str());
+    yield();
+
     FirebaseJson json;
     json.add("ip", ip);
     json.add("temperatura", 20.0);
     json.add("torrando", false);
     json.add("dados", "50.0,0.0,200.0,120.0");
-    json.add("status", false);
+    json.add("aquecendo", false);
+    json.add("resfriando", false);
+    yield();
     Serial.printf("Set json... %s\n\n", Firebase.RTDB.updateNodeAsync(&fbdo, path_aux + mac, &json) ? "ok" : fbdo.errorReason().c_str());
+    yield();
 
     configura_inicio = false;
   }
@@ -688,4 +850,5 @@ void loop()
 
   // put your main code here, to run repeatedly
   check_status();
+  yield();
 }

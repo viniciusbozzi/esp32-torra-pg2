@@ -768,7 +768,7 @@ void loop()
   }
 
 
-  if (millis() - startedAtTempVent > 10000 && iniciaDesligVent) { // 100 segundos de ventilação ligada após termino da torra
+  if (millis() - startedAtTempVent > 100000 && iniciaDesligVent) { // 100 segundos de ventilação ligada após termino da torra
 
     String aux = "/dispositivos/";
     String mac = String(WiFi.macAddress());

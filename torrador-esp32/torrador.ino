@@ -61,7 +61,7 @@ boolean calculo_vetor_PID = true;
 
 //Definicao variaveis PID
 double Setpoint, Input, Output;
-double Kp = 50, Ki = 1, Kd = 70; //default
+double Kp = 40, Ki = 1, Kd = 50; //default
 unsigned long windowStartTime;
 #define PWM_PERIOD 5000
 #define FREQ_PID 250            // Run PID every 250 ms
